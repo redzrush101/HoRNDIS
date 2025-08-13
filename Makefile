@@ -1,25 +1,18 @@
-# For the building the driver for MacOS 10.11+, the preferred
-# XCode version is 7.3.1.
+# For building the driver for macOS 15.0+, use the latest Xcode version
+# available on your system.
 #
-# You can do this by downloading Xcode 7.3.1 as a dmg from Apple, then
-# copying the contents into /Applications as Xcode-7.3.1.
-# If you also want to build from "release_pre_10_11", you may want to
-# also download "Xcode-4.3.3", and copy "MacOSX10.6.sdk" from it to
-# SDK directory under:
-# /Applications/Xcode-7.3.1.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/
+# The driver is compatible with modern macOS versions including Sequoia 15+
 
 -include localconfig.mk
 
 # Can be set from the environment:
-HORNDIS_XCODE ?= /Applications/Xcode*$(XCODE_VER).app
+HORNDIS_XCODE ?= /Applications/Xcode.app
 
-XCODE_VER ?= 7.3.1
 XCODEBUILD ?= $(wildcard $(HORNDIS_XCODE)/Contents/Developer/usr/bin/xcodebuild)
 
 ifeq (,$(XCODEBUILD))
-    $(error Cannot find xcodebuild under $(HORNDIS_XCODE). Please either \
-    	download Xcode $(XCODE_VER) from: "https://developer.apple.com/download" \
-    	and install as /Applications/Xcode-$(XCODE_VER)/ or point HORNDIS_XCODE \
+    $(error Cannot find xcodebuild under $(HORNDIS_XCODE). Please install \
+    	Xcode from the Mac App Store or point HORNDIS_XCODE \
     	to your preferred Xcode app path)
 endif
 
