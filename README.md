@@ -16,7 +16,7 @@ For more information, visit the [HoRNDIS home page](http://www.joshuawise.com/ho
    ```
 2. Navigate to the project directory and build the kernel extension (kext) using Xcode:
    ```sh
-   cd HoRNDIS
+   cd ~/HoRNDIS
    xcodebuild
    ```
 3. To create an installation package, run:
