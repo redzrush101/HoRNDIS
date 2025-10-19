@@ -313,6 +313,11 @@ private:
 	uint16_t outbufStack[N_OUT_BUFS];
 	int numFreeOutBufs;
 
+	uint32_t fInPipeStallSuccesses;
+	uint32_t fOutPipeStallSuccesses;
+	uint32_t fInPipeStallFailures;
+	uint32_t fOutPipeStallFailures;
+
 	void callbackExit();
 	static void dataWriteComplete(void *obj, void *param, IOReturn ior, UInt32 transferred);
 	static void dataReadComplete(void *obj, void *param, IOReturn ior, UInt32 transferred);

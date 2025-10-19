@@ -36,6 +36,9 @@
 #include <IOKit/usb/IOUSBHostDevice.h>
 #include <IOKit/usb/IOUSBHostInterface.h>
 #include <IOKit/network/IOGatedOutputQueue.h>
+#include <IOKit/IOLib.h>
+#include <mach/mach_time.h>
+#include <kern/clock.h>
 // May be useful for supporting suspend/resume:
 // #include <IOKit/pwr_mgt/RootDomain.h>
 
@@ -218,6 +221,11 @@ bool HoRNDIS::init(OSDictionary *properties) {
 
 	rndisXid = 1;
 	maxOutTransferSize = 0;
+
+	fInPipeStallSuccesses = 0;
+	fOutPipeStallSuccesses = 0;
+	fInPipeStallFailures = 0;
+	fOutPipeStallFailures = 0;
 	
 	return true;
 }
@@ -677,30 +685,50 @@ HoRNDIS::ReentryLocker::~ReentryLocker() {
 	}
 }
 
-static IOReturn loopClearPipeStall(IOUSBHostPipe *pipe) {
-	IOReturn rc = kUSBHostReturnPipeStalled;
-	int count = 0;
-	// For some reason, 'clearStall' may keep on returning
-	// kUSBHostReturnPipeStalled many times, before finally returning success
-	// (Android keeps on sending packtes, each generating a stall?).
-	const int NUM_RETRIES = 1000;
-	for (; count < NUM_RETRIES && rc == kUSBHostReturnPipeStalled; count++) {
-		rc = pipe->clearStall(true);
-	}
-	LOG(V_DEBUG, "Called 'clearStall' %d times", count);
-	return rc;
+static IOReturn loopClearPipeStall(IOUSBHostPipe *pipe, const char *pipeLabel, uint32_t &successCounter, uint32_t &failureCounter) {
+    const uint32_t maxRetries = 50;
+    IOReturn rc = kUSBHostReturnPipeStalled;
+    uint32_t attempts = 0;
+    uint64_t deadline = 0;
+
+    clock_interval_to_deadline(200, kMillisecondScale, &deadline);
+
+    while (attempts < maxRetries && rc == kUSBHostReturnPipeStalled) {
+        rc = pipe->clearStall(true);
+        attempts++;
+        if (rc == kUSBHostReturnPipeStalled) {
+            if (mach_absolute_time() > deadline) {
+                LOG(V_ERROR, "%s stall clear exceeded 200ms deadline after %u attempts", pipeLabel, attempts);
+                break;
+            }
+            IOSleep(1);
+        }
+    }
+
+	if (rc == kIOReturnSuccess) {
+		successCounter++;
+		LOG(V_DEBUG, "Cleared %s stall in %u attempts", pipeLabel, attempts);
+	} else if (rc == kUSBHostReturnPipeStalled) {
+		failureCounter++;
+		LOG(V_ERROR, "%s stall persisted after %u attempts", pipeLabel, attempts);
+	} else {
+		failureCounter++;
+		LOG(V_ERROR, "%s stall clear returned error %08x after %u attempts", pipeLabel, rc, attempts);
+    }
+
+    return rc;
 }
 
 /*!
  * Calls 'pipe->io', and if there is a stall, tries to clear that 
  * stall and calls it again.
  */
-static inline IOReturn robustIO(IOUSBHostPipe *pipe, pipebuf_t *buf,
-	uint32_t len) {
+static inline IOReturn robustIO(IOUSBHostPipe *pipe, const char *pipeLabel, uint32_t &successCounter, uint32_t &failureCounter, pipebuf_t *buf,
+    uint32_t len) {
 	IOReturn rc = pipe->io(buf->mdp, len, &buf->comp);
 	if (rc == kUSBHostReturnPipeStalled) {
 		LOG(V_DEBUG, "USB Pipe is stalled. Trying to clear ...");
-		rc = loopClearPipeStall(pipe);
+		rc = loopClearPipeStall(pipe, pipeLabel, successCounter, failureCounter);
 		// If clearing the stall succeeded, try the IO operation again:
 		if (rc == kIOReturnSuccess) {
 			LOG(V_DEBUG, "Cleared USB Stall, Retrying the operation");
@@ -748,8 +776,8 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 	// after that, followed by another "enable". This happens when user runs
 	// "sudo ifconfig <netif> down", followed by "sudo ifconfig <netif> up"
 	LOG(V_DEBUG, "Clearing potential Pipe stalls on Input and Output pipes");
-	loopClearPipeStall(fInPipe);
-	loopClearPipeStall(fOutPipe);
+    loopClearPipeStall(fInPipe, "in", fInPipeStallSuccesses, fInPipeStallFailures);
+    loopClearPipeStall(fOutPipe, "out", fOutPipeStallSuccesses, fOutPipeStallFailures);
 
 	// We can now perform reads and writes between Network stack and USB device:
 	fReadyToTransfer = true;
@@ -761,7 +789,7 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 		inbuf.comp.action = dataReadComplete;
 		inbuf.comp.parameter = &inbuf;
 
-		rtn = robustIO(fInPipe, &inbuf, (uint32_t)inbuf.mdp->getLength());
+        rtn = robustIO(fInPipe, "in", fInPipeStallSuccesses, fInPipeStallFailures, &inbuf, (uint32_t)inbuf.mdp->getLength());
 		if (rtn != kIOReturnSuccess) {
 			LOG(V_ERROR, "Failed to start the first read: %08x\n", rtn);
 			goto bailout;
@@ -1148,7 +1176,7 @@ UInt32 HoRNDIS::outputPacket(mbuf_t packet, void *param) {
 	comp->parameter = (void *)(uintptr_t)poolIndx;
 	comp->action    = dataWriteComplete;
 	
-	ior = robustIO(fOutPipe, &outbufs[poolIndx], transmitLength);
+    ior = robustIO(fOutPipe, "out", fOutPipeStallSuccesses, fOutPipeStallFailures, &outbufs[poolIndx], transmitLength);
 	if (ior != kIOReturnSuccess) {
 		if (isTransferStopStatus(ior)) {
 			LOG(V_DEBUG, "WRITER: The device was possibly disconnected: ignoring the error");
@@ -1247,7 +1275,7 @@ void HoRNDIS::dataReadComplete(void *obj, void *param, IOReturn rc, UInt32 trans
 	}
 	
 	// Queue the next one up.
-	ior = robustIO(me->fInPipe, inbuf, (uint32_t)inbuf->mdp->getLength());
+    ior = robustIO(me->fInPipe, "in", me->fInPipeStallSuccesses, me->fInPipeStallFailures, inbuf, (uint32_t)inbuf->mdp->getLength());
 	if (ior == kIOReturnSuccess) {
 		return;  // Callback is in-progress.
 	}
