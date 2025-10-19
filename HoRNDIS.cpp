@@ -194,6 +194,7 @@ bool HoRNDIS::init(OSDictionary *properties) {
 	
 	fNetworkInterface = NULL;
 	fpNetStats = NULL;
+	fEnableCallDepth = 0;
 
 	fReadyToTransfer = false;
 	fNetifEnabled = false;
@@ -365,8 +366,9 @@ bool HoRNDIS::willTerminate(IOService *provider, IOOptionBits options) {
 	// too).  ::disable happens sometime after we get done here, too --
 	// potentially invoked by super::willTerminate.
 	
-	disableNetworkQueue();
+	disableImpl();
 	closeUSBInterfaces();
+	OSSafeReleaseNULL(fNetworkInterface);
 
 	return super::willTerminate(provider, options);
 }
@@ -374,6 +376,7 @@ bool HoRNDIS::willTerminate(IOService *provider, IOOptionBits options) {
 void HoRNDIS::stop(IOService *provider) {
 	LOG(V_DEBUG, ">");
 	
+	disableImpl();
 	OSSafeReleaseNULL(fNetworkInterface);
 	
 	closeUSBInterfaces();  // Just in case - supposed to be closed by now.
@@ -792,6 +795,7 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 	fReadyToTransfer = true;
 	fDataDead = false;
 	fDataReadRetryCount = 0;
+	fEnableCallDepth++;
 	
 	// Kick off the read requests:
 	for (int i = 0; i < N_IN_BUFS; i++) {
@@ -862,6 +866,10 @@ IOReturn HoRNDIS::disable(IONetworkInterface *netif) {
 		return kIOReturnSuccess;
 	}
 
+	if (fEnableCallDepth == 0) {
+		LOG(V_ERROR, "disableImpl: enable/disable underflow");
+	}
+
 	disableImpl();
 
 	LOG(V_DEBUG, "completed (thread_id=%lld)", thread_tid(current_thread()));
@@ -927,6 +935,11 @@ void HoRNDIS::disableImpl() {
 	releaseResources();
 
 	fNetifEnabled = false;
+	if (fEnableCallDepth > 0) {
+		fEnableCallDepth--;
+	} else {
+		LOG(V_ERROR, "disableImpl: enable/disable imbalance detected");
+	}
 }
 
 bool HoRNDIS::createMediumTables(const IONetworkMedium **primary) {

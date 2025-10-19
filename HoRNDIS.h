@@ -278,6 +278,7 @@ private:
 		
 	IOEthernetInterface *fNetworkInterface;
 	IONetworkStats *fpNetStats;
+	uint32_t fEnableCallDepth;
 
 	bool fReadyToTransfer;  // Ready to transmit: Android <-> MAC.
 	// Set to true when 'enable' succeeds, and
