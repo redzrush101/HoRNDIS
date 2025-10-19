@@ -285,6 +285,8 @@ private:
 	bool fNetifEnabled;
 	bool fEnableDisableInProgress;  // Guards against re-entry
 	bool fDataDead;
+	uint32_t fDataReadRetryCount;
+	uint32_t fDataReadRetryLimit;
 
 	// These pass information from 'probe' to 'openUSBInterfaces':
 	uint8_t fProbeConfigVal;
@@ -334,6 +336,7 @@ private:
 	void closeUSBInterfaces();
 	void disableNetworkQueue();
 	void disableImpl();
+    void scheduleInterfaceReset(const char *reason);
 
 	bool createMediumTables(const IONetworkMedium **primary);
 	bool allocateResources(void);

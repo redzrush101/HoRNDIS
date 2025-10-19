@@ -37,6 +37,7 @@
 #include <IOKit/usb/IOUSBHostInterface.h>
 #include <IOKit/network/IOGatedOutputQueue.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOMessage.h>
 #include <mach/mach_time.h>
 #include <kern/clock.h>
 // May be useful for supporting suspend/resume:
@@ -198,6 +199,8 @@ bool HoRNDIS::init(OSDictionary *properties) {
 	fNetifEnabled = false;
 	fEnableDisableInProgress = false;
 	fDataDead = false;
+	fDataReadRetryCount = 0;
+	fDataReadRetryLimit = 5;
 
 	fProbeConfigVal = 0;
 	fProbeCommIfNum = 0;
@@ -236,6 +239,11 @@ void HoRNDIS::free() {
 
 	LOG(V_NOTE, "driver instance terminated");  // For the default level
 	super::free();
+}
+
+void HoRNDIS::scheduleInterfaceReset(const char *reason) {
+	LOG(V_ERROR, "Scheduling interface reset: %s", reason ? reason : "unknown");
+	messageClients(kIOMessageServiceIsRequestingClose, (void *)reason);
 }
 
 /*
@@ -782,6 +790,8 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 
 	// We can now perform reads and writes between Network stack and USB device:
 	fReadyToTransfer = true;
+	fDataDead = false;
+	fDataReadRetryCount = 0;
 	
 	// Kick off the read requests:
 	for (int i = 0; i < N_IN_BUFS; i++) {
@@ -885,34 +895,32 @@ void HoRNDIS::disableImpl() {
 	// Make sure all the callbacks have exited:
 	LOG(V_DEBUG, "Callback count: %d. If not zero, delaying ...",
 		fCallbackCount);
-	while (fCallbackCount > 0) {
-		IOCommandGate *gate = getCommandGate();
-		if (!gate) {
-			break;
-		}
-		AbsoluteTime deadline = 0;
-		clock_interval_to_deadline(5, kSecondScale, &deadline);
-		IOReturn sleepResult = gate->commandSleep(&fCallbackCount, deadline);
-		if (sleepResult == THREAD_AWAKENED) {
-			continue;
-		}
-		if (sleepResult == THREAD_TIMED_OUT) {
-			fDisableCallbackTimeouts++;
-			LOG(V_ERROR, "disableImpl: callback wait timed out with %d outstanding callbacks", fCallbackCount);
-			if (fInPipe) {
-				fInPipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, NULL);
-			}
-			if (fOutPipe) {
-				fOutPipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, NULL);
-			}
-			fCallbackCount = 0;
-			break;
-		}
-		if (sleepResult != kIOReturnSuccess) {
-			LOG(V_ERROR, "disableImpl: commandSleep returned error %08x", sleepResult);
-			break;
-		}
-	}
+    while (fCallbackCount > 0) {
+        IOCommandGate *gate = getCommandGate();
+        if (!gate) {
+            break;
+        }
+        AbsoluteTime deadline = 0;
+        clock_interval_to_deadline(5, kSecondScale, &deadline);
+        IOReturn sleepResult = gate->commandSleep(&fCallbackCount, deadline);
+        if (sleepResult == kIOReturnSuccess) {
+            continue;
+        }
+        if (sleepResult == kIOReturnTimeout) {
+            fDisableCallbackTimeouts++;
+            LOG(V_ERROR, "disableImpl: callback wait timed out with %d outstanding callbacks", fCallbackCount);
+            if (fInPipe) {
+                fInPipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, NULL);
+            }
+            if (fOutPipe) {
+                fOutPipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, NULL);
+            }
+            fCallbackCount = 0;
+            break;
+        }
+        LOG(V_ERROR, "disableImpl: commandSleep returned error %08x", sleepResult);
+        break;
+    }
 	LOG(V_DEBUG, "All callbacks exited (count=%d)", fCallbackCount);
 
 	// Release all resources
@@ -1294,6 +1302,7 @@ void HoRNDIS::dataReadComplete(void *obj, void *param, IOReturn rc, UInt32 trans
 		// Got one?  Hand it to the back end.
 		LOG(V_PACKET, "Reader(%ld), tid=%lld: %d bytes", inbuf - me->inbufs,
 			thread_tid(current_thread()), transferred);
+		me->fDataReadRetryCount = 0;
 		me->receivePacket(inbuf->mdp->getBytesNoCopy(), transferred);
 	} else {
 		LOG(V_ERROR, "dataReadComplete: I/O error: %08x", rc);
@@ -1306,8 +1315,22 @@ void HoRNDIS::dataReadComplete(void *obj, void *param, IOReturn rc, UInt32 trans
 	}
 
 	LOG(V_ERROR, "READER STOPPED: USB failure trying to read: %08x", ior);
+	if (me->fDataReadRetryCount < me->fDataReadRetryLimit) {
+		me->fDataReadRetryCount++;
+		uint32_t backoffMs = 1u << min(4u, me->fDataReadRetryCount); // cap at 16ms
+		LOG(V_ERROR, "Retrying read (%u/%u) after %u ms", me->fDataReadRetryCount,
+			me->fDataReadRetryLimit, backoffMs);
+		IOSleep(backoffMs);
+		IOReturn retryRc = robustIO(me->fInPipe, "in", me->fInPipeStallSuccesses,
+			me->fInPipeStallFailures, inbuf, (uint32_t)inbuf->mdp->getLength());
+		if (retryRc == kIOReturnSuccess) {
+			return;
+		}
+		LOG(V_ERROR, "Retry read failed with %08x", retryRc);
+	}
 	me->callbackExit();
 	me->fDataDead = true;
+	me->scheduleInterfaceReset("USB read pipeline stalled");
 }
 
 /*!
