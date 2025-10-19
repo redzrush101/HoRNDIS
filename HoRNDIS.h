@@ -317,6 +317,7 @@ private:
 	uint32_t fOutPipeStallSuccesses;
 	uint32_t fInPipeStallFailures;
 	uint32_t fOutPipeStallFailures;
+	uint32_t fDisableCallbackTimeouts;
 
 	void callbackExit();
 	static void dataWriteComplete(void *obj, void *param, IOReturn ior, UInt32 transferred);

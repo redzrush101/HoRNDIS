@@ -226,6 +226,7 @@ bool HoRNDIS::init(OSDictionary *properties) {
 	fOutPipeStallSuccesses = 0;
 	fInPipeStallFailures = 0;
 	fOutPipeStallFailures = 0;
+	fDisableCallbackTimeouts = 0;
 	
 	return true;
 }
@@ -885,10 +886,34 @@ void HoRNDIS::disableImpl() {
 	LOG(V_DEBUG, "Callback count: %d. If not zero, delaying ...",
 		fCallbackCount);
 	while (fCallbackCount > 0) {
-		// No timeout: in our callbacks we trust!
-		getCommandGate()->commandSleep(&fCallbackCount);
+		IOCommandGate *gate = getCommandGate();
+		if (!gate) {
+			break;
+		}
+		AbsoluteTime deadline = 0;
+		clock_interval_to_deadline(5, kSecondScale, &deadline);
+		IOReturn sleepResult = gate->commandSleep(&fCallbackCount, deadline);
+		if (sleepResult == THREAD_AWAKENED) {
+			continue;
+		}
+		if (sleepResult == THREAD_TIMED_OUT) {
+			fDisableCallbackTimeouts++;
+			LOG(V_ERROR, "disableImpl: callback wait timed out with %d outstanding callbacks", fCallbackCount);
+			if (fInPipe) {
+				fInPipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, NULL);
+			}
+			if (fOutPipe) {
+				fOutPipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, NULL);
+			}
+			fCallbackCount = 0;
+			break;
+		}
+		if (sleepResult != kIOReturnSuccess) {
+			LOG(V_ERROR, "disableImpl: commandSleep returned error %08x", sleepResult);
+			break;
+		}
 	}
-	LOG(V_DEBUG, "All callbacks exited");
+	LOG(V_DEBUG, "All callbacks exited (count=%d)", fCallbackCount);
 
 	// Release all resources
 	releaseResources();
